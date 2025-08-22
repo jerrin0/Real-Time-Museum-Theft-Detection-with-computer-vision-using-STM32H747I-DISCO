@@ -1,0 +1,354 @@
+from google.colab import drive
+drive.mount('/content/drive')
+
+!pip uninstall numpy -y
+!pip install numpy==1.25.2
+
+!pip install imgaug --upgrade
+
+PACKAGES
+
+import matplotlib.pyplot as plt
+import numpy as np
+import tensorflow as tf
+import sklearn.metrics as sk_metrics
+import seaborn as sns
+import pathlib
+from tensorflow.keras.preprocessing import image_dataset_from_directory
+from tensorflow.keras import datasets
+from random import randint
+from tensorflow.keras import layers, models
+
+MODEL SELECTION
+
+MODEL_VERSION = 'V2'
+IMG_SIZE = [128, 128]
+IMG_SIZE_TUPLE = (IMG_SIZE[0], IMG_SIZE[1])
+BATCH_SIZE = 16
+
+LOADING DATA
+
+Dataset = pathlib.Path('/content/drive/MyDrive/Colab Notebooks/dataset_image/TRAINING')
+Testset = pathlib.Path('/content/drive/MyDrive/Colab Notebooks/dataset_image/TEST')
+
+# Load training dataset
+dataset = image_dataset_from_directory(Dataset,
+                                       shuffle=True,
+                                       batch_size=BATCH_SIZE,
+                                       image_size=IMG_SIZE,
+                                       interpolation='nearest',
+                                       label_mode='categorical'  # One-hot encoding
+                                       )
+
+# Load test dataset
+test_set = image_dataset_from_directory(Testset,
+                                        shuffle=False,
+                                        batch_size=BATCH_SIZE,
+                                        image_size=IMG_SIZE,
+                                        interpolation='nearest',
+                                        label_mode='categorical'
+                                        )
+
+# Extract class names and class number
+class_names = dataset.class_names
+class_number = len(class_names)
+
+# Split dataset into training and validation
+nbr_batches = tf.data.experimental.cardinality(dataset)
+validation_dataset = dataset.take(nbr_batches // 5)
+train_dataset = dataset.skip(nbr_batches // 5)
+
+# Print dataset details
+print(f"Class names: {class_names}")
+print(f"Total classes: {class_number}")
+
+
+AUGUMENT THE DATA FOR TRAINING SET
+
+import numpy as np
+import imgaug.augmenters as iaa
+
+# Define the augmenter
+augmenter = iaa.Sequential([
+    iaa.Sometimes(0.3, iaa.GaussianBlur((0.0, 0.75)), name='SometimesGaussianBlur'),
+    iaa.GammaContrast((0.7, 1.5), name='GammaContrast'),
+    iaa.MultiplySaturation((0.9, 1.5), name='MultiplySaturation'),
+    iaa.MultiplyAndAddToBrightness(name='BrightnessAdjust'),
+    iaa.Rotate((-15, 15), name='Rotate'),
+    iaa.Fliplr(p=0.5, name='HorizontalFlip'),
+])
+
+# TensorFlow-compatible augmentation function
+def augmentation_function(images, labels):
+    img_dtype = images.dtype
+    img_shape = tf.shape(images)
+
+    images = tf.numpy_function(func=lambda x: augmenter.augment_images(x),
+                               inp=[images],
+                               Tout=img_dtype)
+    images = tf.reshape(images, img_shape)
+    return images, labels
+
+# Get a sample image from your dataset
+image, _ = next(iter(train_dataset.unbatch().batch(1)))
+image_np = image.numpy()
+
+# Plot augmented versions
+plt.figure(figsize=(15, 10))
+for i, augment in enumerate(augmenter):
+    ax = plt.subplot(2, 3, i + 1)
+    augmented_img = augment(image=image_np[0])  # Use `image=` argument for single image
+    ax.imshow(augmented_img.astype(np.uint8))
+    ax.set_title(augment.name.replace("Unnamed", ""))
+    ax.axis("off")
+
+plt.tight_layout()
+plt.show()
+
+
+APPLYING AUGMENTATION ON DATASET
+
+train_dataset = train_dataset.map(augmentation_function, num_parallel_calls=tf.data.AUTOTUNE)
+
+LOADING THE MOBILENET V2 PRE-TRAINED MODEL
+
+IMG_SHAPE = IMG_SIZE_TUPLE + (3,)
+
+# MobileNetV2 model configuration
+normalization = tf.keras.applications.mobilenet_v2.preprocess_input
+base_model = tf.keras.applications.mobilenet_v2.MobileNetV2(
+    input_shape=IMG_SHAPE,
+    alpha=0.35,
+    include_top=False,
+    weights='imagenet'
+)
+
+
+NORMALIZING THE DATA
+
+# Normalizing the datasets
+train_dataset = train_dataset.map(lambda img, label: (normalization(tf.cast(img, tf.float32)), label), num_parallel_calls=tf.data.AUTOTUNE)
+validation_dataset = validation_dataset.map(lambda img, label: (normalization(tf.cast(img, tf.float32)), label), num_parallel_calls=tf.data.AUTOTUNE)
+test_set = test_set.map(lambda img, label: (normalization(tf.cast(img, tf.float32)), label), num_parallel_calls=tf.data.AUTOTUNE)
+
+# Prefetching to improve performance
+train_dataset = train_dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
+validation_dataset = validation_dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
+
+
+MODEL INITIALIZATION WITH FROZEN LAYERS
+
+from tensorflow.keras.regularizers import l2
+from tensorflow.keras.callbacks import EarlyStopping
+
+# Set base model to not trainable initially
+base_model.trainable = False
+
+# Define model architecture with frozen base model
+inputs = tf.keras.Input(shape=IMG_SHAPE)
+x = base_model(inputs, training=False)  # Base model with training=False
+x = tf.keras.layers.GlobalAveragePooling2D()(x)
+x = tf.keras.layers.Dropout(0.3)(x)  # Increased dropout
+outputs = tf.keras.layers.Dense(class_number, activation='softmax', kernel_regularizer=l2(0.01))(x)  # L2 regularization added
+model = tf.keras.Model(inputs, outputs)
+
+# Use a lower learning rate for initial training
+base_learning_rate = 0.0001
+model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=base_learning_rate),
+              loss=tf.keras.losses.CategoricalCrossentropy(),
+              metrics=['accuracy'])
+
+# Print model summary
+model.summary()
+
+
+TRAIN WITH FROZEN LAYERS
+
+h1 = model.fit(train_dataset, validation_data=validation_dataset, epochs=10)
+
+MODEL INITIALIZATION WITH UNFROZEN LAYERS
+
+# Unfreeze some layers for fine-tuning
+base_model.trainable = True
+for layer in base_model.layers[:20]:  # Freeze first 100 layers, you can adjust this depending on your model
+    layer.trainable = False
+
+# Compile with an even lower learning rate for fine-tuning
+model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-5),
+              loss=tf.keras.losses.CategoricalCrossentropy(),
+              metrics=['accuracy'])
+model.summary()
+
+TRAIN WITH UNFROZEN LAYERS
+
+# Train again with early stopping for fine-tuning
+early_stopping_fine_tune = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+h2 = model.fit(train_dataset, validation_data=validation_dataset, epochs=20, callbacks=[early_stopping_fine_tune])
+
+GRAPH FOR FIRST SET
+
+acc = h1.history['accuracy']
+val_acc = h1.history['val_accuracy']
+loss = h1.history['loss']
+val_loss = h1.history['val_loss']
+
+plt.figure(figsize=(8, 8))
+plt.subplot(2, 1, 1)
+plt.plot(acc, label='Training Accuracy')
+plt.plot(val_acc, label='Validation Accuracy')
+plt.legend(loc='lower right')
+plt.ylabel('Accuracy')
+plt.ylim([min(plt.ylim()),1])
+plt.title('Training and Validation Accuracy (h1)')
+
+plt.subplot(2, 1, 2)
+plt.plot(loss, label='Training Loss')
+plt.plot(val_loss, label='Validation Loss')
+plt.legend(loc='upper right')
+plt.ylabel('Cross Entropy')
+plt.ylim([0,1.0])
+plt.title('Training and Validation Loss (h1)')
+plt.xlabel('epoch')
+plt.show()
+
+
+GRAPH FOR SECOND SET
+
+acc = h2.history['accuracy']
+val_acc = h2.history['val_accuracy']
+loss = h2.history['loss']
+val_loss = h2.history['val_loss']
+
+plt.figure(figsize=(8, 8))
+plt.subplot(2, 1, 1)
+plt.plot(acc, label='Training Accuracy')
+plt.plot(val_acc, label='Validation Accuracy')
+plt.legend(loc='lower right')
+plt.ylabel('Accuracy')
+plt.ylim([min(plt.ylim()),1])
+plt.title('Training and Validation Accuracy ')
+
+plt.subplot(2, 1, 2)
+plt.plot(loss, label='Training Loss')
+plt.plot(val_loss, label='Validation Loss')
+plt.legend(loc='upper right')
+plt.ylabel('Cross Entropy')
+plt.ylim([0,1.0])
+plt.title('Training and Validation Loss ')
+plt.xlabel('epoch')
+plt.show()
+
+TEST THE MODEL
+
+validation_dataset = validation_dataset.cache()
+print("Evaluate on test data")
+results = model.evaluate(validation_dataset)
+print(f"test loss: {results[0]}, test acc: {results[1]}")
+predictions = model.predict(validation_dataset)
+predictions = tf.argmax(predictions, axis=1)
+
+true_categories = tf.argmax( np.concatenate([y for x, y in validation_dataset], axis=0), axis=1)
+
+confusion = sk_metrics.confusion_matrix(true_categories, predictions)
+confusion_normalized = [element/sum(row) for element, row in zip([row for row in confusion], confusion)]
+
+axis_labels = list(class_names)
+plt.figure(figsize=(10, 10))
+ax = sns.heatmap(confusion_normalized, xticklabels=axis_labels, yticklabels=axis_labels, cmap='Blues',
+                  annot=True,
+                  fmt='.2f', square=True)
+plt.title("Confusion matrix")
+plt.ylabel("True label")
+plt.xlabel("Predicted label");
+
+MISCLASSIFIED SAMPLES
+
+misclassified_images = []
+misclassified_category = []
+misclassified_prediction = []
+for (image, true_category), prediction in zip(test_set.unbatch(), predictions):
+  true_category = tf.argmax(true_category)
+  if true_category != prediction:
+    misclassified_images.append(image.numpy())
+    misclassified_category.append(true_category)
+    misclassified_prediction.append(prediction)
+print('Number of misclassified images : ', len(misclassified_images))
+
+if len(misclassified_images) >= 9 :
+  plt.figure(figsize=(17, 13))
+  random_index_shift = randint(0, len(misclassified_images) - 9)
+  for i in range(9):
+    ax = plt.subplot(3, 3, i + 1)
+    title = 'Actual : ' + class_names[misclassified_category[random_index_shift + i]] + \
+            ' Predicted : ' + class_names[misclassified_prediction[random_index_shift + i]]
+    ax.set_title(title)
+    plt.imshow((misclassified_images[random_index_shift + i] + 1.0) / 2.0)
+    plt.axis('off')
+
+QUANTIZE AND EXPORT
+
+import tensorflow as tf
+import pathlib
+
+# Ensure the model is in evaluation mode for quantization
+model.trainable = False  # Freeze the model so it is not trainable
+model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])  # Compile for evaluation
+
+# Define the representative dataset generator
+def representative_data_gen():
+    for x, y in validation_dataset.take(100):  # Use 100 samples from validation dataset
+        # Ensure the image data is in float32 before scaling (no need for uint8 conversion here)
+        x = tf.cast(x, tf.float32)  # Keep it in float32 format
+        x = x * 255.0  # Scale to [0, 255] (float32)
+        yield [x]  # Yield the input data in the required format
+
+# Create the TFLite converter and apply optimizations
+converter = tf.lite.TFLiteConverter.from_keras_model(model)
+converter.optimizations = [tf.lite.Optimize.DEFAULT]  # Apply default optimizations (quantization)
+
+# Assign the representative dataset for quantization
+converter.representative_dataset = representative_data_gen
+
+# Specify supported operations for quantization to int8
+converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+
+# Perform the conversion
+tflite_model_quant = converter.convert()
+
+# Save the quantized model to a file
+tflite_model_quant_file = pathlib.Path("./model_quant.tflite")
+tflite_model_quant_file.write_bytes(tflite_model_quant)
+
+print("Quantized model saved as 'model_quant.tflite'")
+
+
+TESTING THE QUANTIZED MODEL
+
+# Initialize the interpreter
+interpreter = tf.lite.Interpreter(model_path=str("./model_quant.tflite"))
+interpreter.allocate_tensors()
+
+input_details = interpreter.get_input_details()[0]
+output_details = interpreter.get_output_details()[0]
+
+quant_correct_predictions = 0
+quant_incorrect_predictions = 0
+
+for (image, true_category) in test_set.unbatch():
+  test_image = image
+  test_label = tf.argmax(true_category)
+
+  # Check if the input type is quantized, then rescale input data to uint8
+  if input_details['dtype'] == np.uint8:
+    input_scale, input_zero_point = input_details["quantization"]
+    test_image = test_image / input_scale + input_zero_point
+
+  test_image = np.expand_dims(test_image, axis=0).astype(input_details["dtype"])
+  interpreter.set_tensor(input_details["index"], test_image)
+  interpreter.invoke()
+  output = interpreter.get_tensor(output_details["index"])[0]
+  if(output.argmax() == test_label):
+    quant_correct_predictions += 1
+  else:
+    quant_incorrect_predictions += 1
+print(f'Accuracy : {quant_correct_predictions / (quant_correct_predictions + quant_incorrect_predictions)}')
